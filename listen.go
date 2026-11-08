@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	_ "embed"
@@ -12,20 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
 )
-
-// The speech recognizer runs as a small Python helper (Nemotron ASR Streaming,
-// Persian fine-tune) started with `uv run`, so its dependencies install themselves.
-//
-//go:embed asr/nemotron_stream.py
-var nemotronScript []byte
 
 type liveConfig struct {
 	lookahead   int
@@ -43,16 +34,14 @@ type liveConfig struct {
 // liveTranscriber streams audio into the recognizer, shows the Persian words as
 // they are recognised, cuts them into phrases and translates each phrase.
 type liveTranscriber struct {
-	cfg     liveConfig
-	ctx     context.Context
-	audio   chan []byte
-	decoder *exec.Cmd
-	asr     *exec.Cmd
-	decIn   io.WriteCloser
-	tty     bool
-	logW    io.WriteCloser
-	httpc   *http.Client
-	queue   chan phrase
+	cfg    liveConfig
+	ctx    context.Context
+	server *asrServer
+	stream *asrStream
+	tty    bool
+	logW   io.WriteCloser
+	httpc  *http.Client
+	queue  chan phrase
 
 	mu       sync.Mutex // guards terminal output and the current phrase
 	phrase   []string
@@ -65,26 +54,6 @@ type phrase struct {
 	text string
 }
 
-// scriptPath writes the embedded recognizer script to the user cache so that
-// `uv run --script` can execute it (and cache its environment).
-func scriptPath() (string, error) {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	dir = filepath.Join(dir, "farhang")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	p := filepath.Join(dir, "nemotron_stream.py")
-	if old, err := os.ReadFile(p); err != nil || !bytes.Equal(old, nemotronScript) {
-		if err := os.WriteFile(p, nemotronScript, 0o644); err != nil {
-			return "", err
-		}
-	}
-	return p, nil
-}
-
 func newLiveTranscriber(ctx context.Context, cfg liveConfig) (*liveTranscriber, error) {
 	for _, bin := range []string{"ffmpeg", "uv"} {
 		if _, err := exec.LookPath(bin); err != nil {
@@ -94,7 +63,6 @@ func newLiveTranscriber(ctx context.Context, cfg liveConfig) (*liveTranscriber, 
 	lt := &liveTranscriber{
 		cfg:   cfg,
 		ctx:   ctx,
-		audio: make(chan []byte, 32),
 		queue: make(chan phrase, 16),
 		tty:   term.IsTerminal(int(os.Stdout.Fd())),
 		httpc: &http.Client{Timeout: 3 * time.Minute},
@@ -113,121 +81,39 @@ func newLiveTranscriber(ctx context.Context, cfg liveConfig) (*liveTranscriber, 
 		fmt.Fprintf(f, "\n## %s\n\n", time.Now().Format("2006-01-02 15:04"))
 	}
 
-	// AAC segments -> ffmpeg -> 16 kHz mono PCM -> recognizer -> words (JSON lines).
-	script, err := scriptPath()
-	if err != nil {
+	var err error
+	if lt.server, err = startASR(ctx, cfg.lookahead, cfg.asrThreads); err != nil {
 		return nil, err
 	}
-	lt.decoder = exec.Command("ffmpeg", "-v", "error", "-f", "aac", "-i", "pipe:0",
-		"-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1")
-	lt.asr = exec.Command("uv", "run", "-q", "--script", script,
-		"--lookahead", fmt.Sprint(cfg.lookahead), "--threads", fmt.Sprint(cfg.asrThreads))
-	if lt.decIn, err = lt.decoder.StdinPipe(); err != nil {
+	if lt.stream, err = lt.server.Open(ctx); err != nil {
+		lt.server.Close()
 		return nil, err
 	}
-	pcm, err := lt.decoder.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	lt.asr.Stdin = pcm
-	lt.asr.Stderr = os.Stderr
-	// Own process group: `uv` does not forward signals to the Python process it starts.
-	lt.asr.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	lt.asr.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "TRANSFORMERS_VERBOSITY=error",
-		"TQDM_DISABLE=1")
-	words, err := lt.asr.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := lt.decoder.Start(); err != nil {
-		return nil, fmt.Errorf("starting ffmpeg: %w", err)
-	}
-	if err := lt.asr.Start(); err != nil {
-		return nil, fmt.Errorf("starting recognizer: %w", err)
-	}
-
-	ready := make(chan struct{})
-	go lt.readWords(words, ready)
-	go lt.feedAudio()
+	go lt.readWords()
 	go lt.pauseWatcher()
 	go lt.translateLoop()
-
-	log.Printf("loading the speech model (the first run downloads it, ~2.4 GB) …")
-	select {
-	case <-ready:
-		log.Printf("speech model ready")
-	case <-ctx.Done():
-	case <-time.After(30 * time.Minute):
-		return nil, fmt.Errorf("speech model did not start")
-	}
 	return lt, nil
 }
 
 // Push receives one AAC segment from the stream; it never blocks playback.
 func (lt *liveTranscriber) Push(seg []byte) {
-	select {
-	case lt.audio <- seg:
-	default:
+	if !lt.stream.Push(seg) {
 		log.Printf("recognizer is behind; dropping 10 s of audio to stay live")
 	}
 }
 
-func (lt *liveTranscriber) feedAudio() {
-	for {
-		select {
-		case <-lt.ctx.Done():
-			return
-		case seg := <-lt.audio:
-			if _, err := lt.decIn.Write(seg); err != nil {
-				return
-			}
-		}
-	}
-}
-
 func (lt *liveTranscriber) Close() {
+	lt.stream.Close()
 	lt.flush()
-	if lt.decIn != nil {
-		lt.decIn.Close() // ends ffmpeg, then the recognizer sees end of audio
-	}
-	for _, c := range []*exec.Cmd{lt.decoder, lt.asr} {
-		if c == nil || c.Process == nil {
-			continue
-		}
-		done := make(chan struct{})
-		go func() { _ = c.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			if c == lt.asr {
-				_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) // uv and the Python helper
-			} else {
-				_ = c.Process.Kill()
-			}
-			<-done
-		}
-	}
+	lt.server.Close()
 	if lt.logW != nil {
 		lt.logW.Close()
 	}
 }
 
-func (lt *liveTranscriber) readWords(r io.Reader, ready chan struct{}) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		var ev struct{ Type, Text string }
-		if json.Unmarshal(sc.Bytes(), &ev) != nil {
-			continue
-		}
-		switch ev.Type {
-		case "ready":
-			close(ready)
-		case "text":
-			for _, w := range strings.Fields(ev.Text) {
-				lt.addWord(w)
-			}
-		}
+func (lt *liveTranscriber) readWords() {
+	for w := range lt.stream.Words {
+		lt.addWord(w.Text)
 	}
 }
 

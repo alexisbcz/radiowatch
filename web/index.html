@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radiowatch</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#262d37; --text:#e6e8eb; --dim:#8b949e; --red:#f85149; --amber:#d29922; --blue:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .note { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns: minmax(0,2fr) minmax(0,1fr); gap:16px; padding:16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }
+  .ev { border-top:1px solid var(--line); padding:10px 0; }
+  .ev:first-of-type { border-top:0; }
+  .ev .meta { color:var(--dim); font-size:12px; }
+  .ev .title { font-weight:600; margin:2px 0; }
+  .ev.breaking .title { color:var(--red); }
+  .ev.high .title { color:var(--amber); }
+  .ev.analysis { opacity:.7; }
+  .tag { display:inline-block; font-size:11px; padding:0 6px; border-radius:10px; border:1px solid var(--line); margin-right:4px; }
+  .tag.b { border-color:var(--red); color:var(--red); }
+  .quote { direction:rtl; text-align:right; color:var(--dim); font-size:13px; margin-top:4px; }
+  .st { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-top:1px solid var(--line); cursor:pointer; }
+  .st:first-of-type { border-top:0; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--red); margin-right:6px; }
+  .dot.on { background:#3fb950; }
+  .live { direction:rtl; text-align:right; font-size:15px; line-height:1.9; max-height:340px; overflow:auto; white-space:pre-wrap; }
+  .controls { display:flex; gap:10px; align-items:center; margin-bottom:8px; color:var(--dim); font-size:12px; }
+  a { color:var(--blue); }
+</style>
+</head>
+<body>
+<header>
+  <h1>radiowatch</h1>
+  <span class="note">Claims extracted from live state-media radio by speech recognition and an LLM. Not verified. Feeds: <a href="/feed.xml">RSS</a> · <a href="/feed/breaking.xml">breaking RSS</a> · <a href="/api/events">JSON</a> · <a href="/api/events.geojson">GeoJSON</a></span>
+</header>
+<main>
+  <section>
+    <h2>Extracted items</h2>
+    <div class="controls">
+      <label><input type="checkbox" id="hideAnalysis" checked> hide analysis &amp; citations</label>
+      <label><input type="checkbox" id="breakingOnly"> breaking only</label>
+    </div>
+    <div id="events"></div>
+  </section>
+  <div style="display:grid; gap:16px; align-content:start">
+    <section><h2>Stations</h2><div id="stations"></div></section>
+    <section><h2>Live transcript <span id="liveName"></span></h2><div class="live" id="live"></div></section>
+  </div>
+</main>
+<script>
+let current = null;
+const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const time = t => new Date(t).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+
+async function events() {
+  const q = new URLSearchParams({since: "48h", limit: "200"});
+  if (document.getElementById("breakingOnly").checked) q.set("breaking", "1");
+  if (document.getElementById("hideAnalysis").checked) q.set("kind", "event_report,official_statement,threat,other");
+  const {events} = await (await fetch("/api/events?" + q)).json();
+  document.getElementById("events").innerHTML = (events || []).map(e => {
+    const cls = e.breaking ? "breaking" : e.importance >= 4 ? "high" : (e.kind === "analysis" || e.kind === "foreign_media_citation") ? "analysis" : "";
+    const places = (e.locations || []).map(l => esc(l.name_en)).join(", ");
+    const also = (e.alsoOn || []).length ? ` · also on ${e.alsoOn.length} other station(s)` : "";
+    return `<div class="ev ${cls}">
+      <div class="meta">${time(e.firstSeen)} · ${esc(e.station.name)}${places ? " · " + places : ""}${also}</div>
+      <div class="title">${e.breaking ? '<span class="tag b">BREAKING</span>' : ""}${esc(e.title)}</div>
+      <div>${esc(e.summary)}</div>
+      <div class="meta"><span class="tag">${esc(e.kind.replaceAll("_"," "))}</span><span class="tag">${esc(e.category)}</span>importance ${e.importance}/5 · claimed by ${esc(e.claimedBy)}${e.quoteVerified ? "" : " · quote not found in transcript"}</div>
+      <div class="quote">${esc(e.quote)}</div>
+    </div>`;
+  }).join("") || '<div class="meta">No items yet. Windows are sent for extraction every few minutes.</div>';
+}
+
+async function stations() {
+  const {stations} = await (await fetch("/api/stations")).json();
+  if (!current && stations.length) current = stations[0].station.id;
+  document.getElementById("stations").innerHTML = stations.map(s => `
+    <div class="st" onclick="current='${s.station.id}'; live()">
+      <span><span class="dot ${s.connected ? "on" : ""}"></span>${esc(s.station.name)}</span>
+      <span class="meta">${s.words} words · ${s.events} items</span>
+    </div>`).join("");
+}
+
+async function live() {
+  if (!current) return;
+  const t = await (await fetch(`/api/transcript?station=${encodeURIComponent(current)}&minutes=5`)).json();
+  document.getElementById("liveName").textContent = "· " + t.station.name;
+  const el = document.getElementById("live");
+  el.textContent = t.text || "…";
+  el.scrollTop = el.scrollHeight;
+}
+
+for (const id of ["hideAnalysis", "breakingOnly"]) document.getElementById(id).onchange = events;
+async function tick() { try { await Promise.all([events(), stations()]); await live(); } catch {} }
+tick(); setInterval(tick, 4000);
+</script>
+</body>
+</html>

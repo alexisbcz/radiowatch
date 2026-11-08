@@ -36,20 +36,9 @@ func get(ctx context.Context, u string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-var m3u8RE = regexp.MustCompile(`https://[^"'\s<>]+\.m3u8`)
+var errStalled = errors.New("stream stalled")
 
-// resolve finds the HLS master playlist for a channel from the official player page.
-func resolve(ctx context.Context, ch int) (string, error) {
-	page := fmt.Sprintf("https://player.iranseda.ir/live-player/?VALID=TRUE&CH=%d&t=b&auto=true", ch)
-	body, err := get(ctx, page)
-	if err != nil {
-		return "", err
-	}
-	if m := m3u8RE.Find(body); m != nil {
-		return string(m), nil
-	}
-	return "", fmt.Errorf("no stream found on player page for channel %d", ch)
-}
+var m3u8RE = regexp.MustCompile(`https://[^"'\s<>]+\.m3u8`)
 
 type segment struct {
 	seq int
@@ -116,7 +105,13 @@ func stream(ctx context.Context, master string, onSegment func([]byte) error) er
 	base, _ := url.Parse(media)
 	next := -1 // next sequence number to fetch
 	fails := 0
+	lastNew := time.Now()
 	for {
+		// A live stream whose playlist stops advancing has stalled (seen on IRIB CDN
+		// edges); return so the caller can resolve a fresh edge.
+		if time.Since(lastNew) > 90*time.Second {
+			return errStalled
+		}
 		body, err := get(ctx, media)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -161,6 +156,7 @@ func stream(ctx context.Context, master string, onSegment func([]byte) error) er
 				return err
 			}
 			next = s.seq + 1
+			lastNew = time.Now()
 		}
 		if ended {
 			return nil

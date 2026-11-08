@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "headline": {"type": "string"},
+          "summary": {"type": "string"},
+          "kind": {"type": "string", "enum": ["event_report", "official_statement", "threat", "analysis", "foreign_media_citation", "other"]},
+          "category": {"type": "string", "enum": ["military", "attack", "explosion", "air_defense", "nuclear", "casualties", "security", "protest", "politics", "diplomacy", "economy", "disaster", "accident", "health", "other"]},
+          "breaking": {"type": "boolean"},
+          "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+          "claimed_by": {"type": "string"},
+          "actors": {"type": "array", "items": {"type": "string"}},
+          "locations": {"type": "array", "items": {"type": "object", "properties": {"name_en": {"type": "string"}, "name_original": {"type": "string"}, "country": {"type": "string"}}, "required": ["name_en", "name_original", "country"]}},
+          "when": {"type": "string", "description": "time reference as stated, e.g. 'this morning', 'yesterday', 'unspecified'"},
+          "quote": {"type": "string"}
+        },
+        "required": ["headline", "summary", "kind", "category", "breaking", "importance", "claimed_by", "actors", "locations", "when", "quote"]
+      }
+    }
+  },
+  "required": ["items"]
+}
