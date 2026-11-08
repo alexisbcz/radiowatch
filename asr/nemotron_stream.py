@@ -15,7 +15,10 @@
 # [tool.uv.sources]
 # torch = { index = "pytorch-cpu" }
 # ///
-"""Live Persian speech recognition with Nemotron ASR Streaming (Farsi).
+"""Live speech recognition with NVIDIA Nemotron ASR Streaming.
+
+Persian uses a Persian fine-tune; Russian, Mandarin and the other supported
+languages use NVIDIA's multilingual base model. Each model is loaded on first use.
 
 Audio in: raw 16 kHz mono signed 16-bit little-endian PCM, as it arrives.
 Words out: JSON lines, as they are recognised.
@@ -24,11 +27,13 @@ Words out: JSON lines, as they are recognised.
     {"type": "text", "text": "سلام ", "t": 12.4}     # t = seconds of audio consumed
 
 Two modes:
-  stdin   (default)    one stream: PCM on stdin, JSON on stdout
+  stdin   (default)    one stream: PCM on stdin, JSON on stdout (--language)
   --serve PORT         many streams: each TCP connection on 127.0.0.1:PORT is one
-                       stream (PCM in, JSON out); all share one copy of the model
+                       stream. The client first sends one line, {"language": "ru"},
+                       then PCM. All streams share one copy of each model.
 
-Model: https://huggingface.co/mehdi-hf/nemotron-asr-streaming-farsi
+Models: https://huggingface.co/mehdi-hf/nemotron-asr-streaming-farsi
+        https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
 """
 import argparse
 import json
@@ -42,7 +47,21 @@ import numpy as np
 
 warnings.filterwarnings("ignore", message=".*max_length.*")
 
-MODEL_ID = "mehdi-hf/nemotron-asr-streaming-farsi"
+PERSIAN_MODEL = "mehdi-hf/nemotron-asr-streaming-farsi"
+MULTILINGUAL_MODEL = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+# ISO 639-1 -> (model, language prompt). The multilingual model takes locales.
+LOCALES = {"ru": "ru-RU", "zh": "zh-CN", "en": "en-US", "ar": "ar-AR", "uk": "uk-UA", "tr": "tr-TR",
+           "fr": "fr-FR", "de": "de-DE", "es": "es-ES", "hi": "hi-IN", "ja": "ja-JP", "ko": "ko-KR",
+           "vi": "vi-VN", "pl": "pl-PL", "it": "it-IT", "pt": "pt-BR"}
+
+
+def model_for(lang):
+    if lang in ("fa", "fa-IR"):
+        return PERSIAN_MODEL, "fa-IR"
+    if lang in LOCALES:
+        return MULTILINGUAL_MODEL, LOCALES[lang]
+    return MULTILINGUAL_MODEL, lang if "-" in lang else "auto"
+
 SR = 16000
 READ_SAMPLES = 3200  # 0.2 s per read
 
@@ -91,7 +110,7 @@ class PCMBuffer:
 
 
 class Recognizer:
-    def __init__(self, lookahead, threads):
+    def __init__(self, model_id, lookahead, threads):
         import torch
         from transformers import AutoModelForRNNT, AutoProcessor
         from transformers.utils import logging as hf_logging
@@ -100,9 +119,9 @@ class Recognizer:
         hf_logging.disable_progress_bar()
         torch.set_num_threads(threads)
         self.torch = torch
-        log(f"loading {MODEL_ID} (first run downloads ~2.4 GB) …")
-        self.processor = AutoProcessor.from_pretrained(MODEL_ID)
-        self.model = AutoModelForRNNT.from_pretrained(MODEL_ID).eval()
+        log(f"loading {model_id} (first run downloads ~2.4 GB) …")
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = AutoModelForRNNT.from_pretrained(model_id).eval()
         self.processor.set_num_lookahead_tokens(lookahead)
         log(f"ready (look-ahead {lookahead}, {threads} threads)")
 
@@ -121,11 +140,11 @@ class Recognizer:
         m.generation_config = self.model.generation_config
         return m.eval()
 
-    def features(self, audio, first):
+    def features(self, audio, first, language):
         return self.processor(audio, sampling_rate=SR, is_streaming=True, is_first_audio_chunk=first,
-                              language="fa-IR", return_tensors="pt").to(self.model.device, dtype=self.model.dtype)
+                              language=language, return_tensors="pt").to(self.model.device, dtype=self.model.dtype)
 
-    def run(self, read, emit):
+    def run(self, read, emit, language="fa-IR"):
         """Transcribe one stream until it ends: read(n) -> bytes, emit(dict)."""
         from transformers import TextIteratorStreamer
 
@@ -137,7 +156,7 @@ class Recognizer:
         pcm = PCMBuffer(read)
         if not pcm.ensure(n_first):
             return
-        first = self.features(pcm.get(0, n_first), True)
+        first = self.features(pcm.get(0, n_first), True, language)
         consumed = [n_first]  # samples handed to the model, for word timestamps
 
         def chunks():
@@ -153,7 +172,7 @@ class Recognizer:
                     # End of stream: two chunks of silence release the held-back look-ahead.
                     pcm.pad(end + 2 * n_chunk - (pcm.base + len(pcm.buf)))
                     flushed = True
-                yield self.features(pcm.get(start, end), False).input_features
+                yield self.features(pcm.get(start, end), False, language).input_features
                 consumed[0] = end
                 mel += mel_chunk
                 start = mel * hop - n_fft // 2
@@ -176,7 +195,25 @@ class Recognizer:
         worker.join()
 
 
-def serve(rec, port):
+class Models:
+    """Loads each model once, on first use, and shares it between streams."""
+
+    def __init__(self, lookahead, threads):
+        self.lookahead, self.threads = lookahead, threads
+        self.loaded = {}
+        self.lock = threading.Lock()
+
+    def get(self, lang):
+        model_id, prompt = model_for(lang)
+        with self.lock:
+            if model_id not in self.loaded:
+                self.loaded[model_id] = Recognizer(model_id, self.lookahead, self.threads)
+        return self.loaded[model_id], prompt
+
+
+def serve(models, port, preload):
+    for lang in preload:
+        models.get(lang)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -192,8 +229,10 @@ def serve(rec, port):
                 conn.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode())
 
         try:
-            emit({"type": "ready"})
-            rec.run(rf.read, emit)
+            header = json.loads(rf.readline() or b"{}")
+            rec, prompt = models.get(header.get("language", "fa"))
+            emit({"type": "ready", "language": prompt})
+            rec.run(rf.read, emit, prompt)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
@@ -214,19 +253,22 @@ def main():
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--serve", type=int, metavar="PORT",
                     help="serve many streams over TCP on 127.0.0.1:PORT (0 = any free port)")
+    ap.add_argument("--language", default="fa", help="language (ISO 639-1, e.g. fa, ru, zh)")
+    ap.add_argument("--preload", default="", help="comma-separated languages to load before serving")
     args = ap.parse_args()
 
-    rec = Recognizer(args.lookahead, args.threads)
+    models = Models(args.lookahead, args.threads)
     if args.serve is not None:
-        serve(rec, args.serve)
+        serve(models, args.serve, [x for x in args.preload.split(",") if x])
         return
+    rec, prompt = models.get(args.language)
 
     def emit(obj):
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
     emit({"type": "ready"})
-    rec.run(sys.stdin.buffer.read, emit)
+    rec.run(sys.stdin.buffer.read, emit, prompt)
 
 
 if __name__ == "__main__":

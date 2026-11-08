@@ -28,11 +28,16 @@ type place struct {
 	name       string
 	lat, lon   float64
 	class      byte // P populated place, A admin area, T terrain, H water, S spot/facility
+	country    string
 	admin1     string
 	population int
 }
 
 var gaz = &gazetteer{byName: map[string][]place{}}
+
+// gazetteersFor lists the GeoNames country dumps to load for a station's
+// country: its own, plus the places its radio reports on most.
+var gazetteersFor = map[string][]string{"IR": {"IR"}, "RU": {"RU", "UA"}, "CN": {"CN", "TW"}}
 
 // admin1 maps "IR.26"-style codes to province names, from GeoNames' admin1CodesASCII.txt.
 var admin1 = map[string]string{}
@@ -85,6 +90,42 @@ func init() {
 	add(46.2, 2.2, "France", "فرانسه")
 	add(55.4, -3.4, "United Kingdom", "Britain", "UK", "انگلیس", "بریتانیا")
 	add(50.85, 4.35, "Europe", "اروپا")
+	// Russia and Ukraine
+	add(49.0, 32.0, "Ukraine", "Украина")
+	add(52.0, 19.0, "Poland", "Польша")
+	add(53.7, 28.0, "Belarus", "Беларусь")
+	add(45.3, 34.4, "Crimea", "Крым")
+	add(48.0, 37.8, "Donbas", "Donbass", "Донбасс")
+	add(45.3, 36.5, "Kerch Strait", "Crimean Bridge", "Керченский пролив", "Крымский мост")
+	add(43.4, 34.0, "Black Sea", "Чёрное море", "Черное море")
+	add(46.0, 36.6, "Sea of Azov", "Азовское море")
+	add(47.51, 34.59, "Zaporizhzhia nuclear power plant", "Zaporizhzhia NPP", "Запорожская АЭС")
+	add(51.67, 35.6, "Kursk nuclear power plant", "Курская АЭС")
+	add(50.85, 4.35, "NATO", "НАТО")
+	// China and the region
+	add(23.7, 121.0, "Taiwan", "台湾", "台灣")
+	add(24.5, 119.5, "Taiwan Strait", "台湾海峡")
+	add(12.0, 114.0, "South China Sea", "南海")
+	add(29.0, 125.0, "East China Sea", "东海")
+	add(16.5, 112.0, "Paracel Islands", "西沙群岛")
+	add(10.0, 114.0, "Spratly Islands", "南沙群岛")
+	add(25.75, 123.5, "Senkaku Islands", "Diaoyu Islands", "钓鱼岛")
+	add(22.3, 114.17, "Hong Kong", "香港")
+	add(22.2, 113.55, "Macau", "Macao", "澳门")
+	add(36.2, 138.25, "Japan", "日本")
+	add(35.9, 127.8, "South Korea", "韩国")
+	add(40.3, 127.5, "North Korea", "朝鲜")
+	add(12.9, 121.8, "Philippines", "菲律宾")
+	add(14.1, 108.3, "Vietnam", "越南")
+	add(20.6, 79.0, "India", "印度")
+	// country names as said on Russian and Chinese radio
+	add(39.8, -98.6, "США", "Соединённые Штаты", "美国")
+	add(61.5, 105.3, "Россия", "俄罗斯")
+	add(35.9, 104.2, "Китай", "КНР", "中国")
+	add(32.0, 53.0, "Иран", "伊朗")
+	add(49.0, 32.0, "乌克兰")
+	add(31.4, 35.0, "Израиль", "以色列")
+	add(31.4, 34.4, "Газа", "加沙")
 }
 
 func cachedDownload(ctx context.Context, url, name string) ([]byte, error) {
@@ -144,7 +185,7 @@ func loadGazetteer(ctx context.Context, country string) error {
 			if len(c) < 15 || !strings.Contains("PATHS", c[6]) || c[6] == "" {
 				continue
 			}
-			p := place{name: c[1], class: c[6][0], admin1: admin1[c[8]+"."+c[10]]}
+			p := place{name: c[1], class: c[6][0], admin1: admin1[c[8]+"."+c[10]], country: c[8]}
 			p.id, _ = strconv.Atoi(c[0])
 			p.lat, _ = strconv.ParseFloat(c[4], 64)
 			p.lon, _ = strconv.ParseFloat(c[5], 64)
@@ -187,8 +228,15 @@ func classRank(c byte) int {
 	return strings.IndexByte("PAHTS", c)
 }
 
-// geocode fills in coordinates for a location in the gazetteer's country,
-// trying the name as spoken first.
+// countryCodes maps the country names the model writes to ISO codes.
+var countryCodes = map[string]string{
+	"iran": "IR", "ir": "IR", "ایران": "IR", "russia": "RU", "ru": "RU", "russian federation": "RU",
+	"ukraine": "UA", "ua": "UA", "china": "CN", "cn": "CN", "prc": "CN", "taiwan": "TW", "tw": "TW",
+}
+
+// geocode fills in coordinates, trying the name as spoken first: landmarks and
+// countries, then the loaded GeoNames dumps (restricted to the location's country
+// when the model names one).
 func (g *gazetteer) geocode(l *Location) {
 	for _, nm := range []string{l.NameOriginal, l.NameEn} {
 		if c, ok := landmarks[placeKey(nm)]; ok {
@@ -196,24 +244,24 @@ func (g *gazetteer) geocode(l *Location) {
 			return
 		}
 	}
-	if cc := strings.ToLower(strings.TrimSpace(l.Country)); cc != "iran" && cc != "ir" && cc != "ایران" {
-		return // foreign place: not in this gazetteer
-	}
+	want := countryCodes[strings.ToLower(strings.TrimSpace(l.Country))]
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	for _, nm := range []string{l.NameOriginal, l.NameEn} {
-		cands := g.byName[placeKey(nm)]
-		if len(cands) == 0 {
-			continue
-		}
-		best := cands[0]
-		for _, c := range cands[1:] {
-			if classRank(c.class) < classRank(best.class) ||
+		var best *place
+		for _, c := range g.byName[placeKey(nm)] {
+			if want != "" && c.country != want {
+				continue
+			}
+			if best == nil || classRank(c.class) < classRank(best.class) ||
 				(c.class == best.class && c.population > best.population) {
-				best = c
+				cc := c
+				best = &cc
 			}
 		}
-		l.Lat, l.Lon, l.GeonameID, l.Admin1 = best.lat, best.lon, best.id, best.admin1
-		return
+		if best != nil {
+			l.Lat, l.Lon, l.GeonameID, l.Admin1 = best.lat, best.lon, best.id, best.admin1
+			return
+		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // The speech recognizer is a Python helper (Nemotron ASR Streaming, Persian
@@ -28,9 +29,10 @@ var nemotronScript []byte
 
 // Word is one recognised word.
 type Word struct {
-	Text string
-	T    float64   // seconds of stream audio consumed when it was emitted
-	At   time.Time // wall-clock time it was received
+	Text  string
+	Space bool      // preceded by a space in the recognizer's output (false inside Chinese text)
+	T     float64   // seconds of stream audio consumed when it was emitted
+	At    time.Time // wall-clock time it was received
 }
 
 type asrServer struct {
@@ -58,7 +60,7 @@ func scriptPath() (string, error) {
 	return p, nil
 }
 
-func startASR(ctx context.Context, lookahead, threads int) (*asrServer, error) {
+func startASR(ctx context.Context, lookahead, threads int, preload []string) (*asrServer, error) {
 	for _, bin := range []string{"ffmpeg", "uv"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			return nil, fmt.Errorf("%s not found in PATH", bin)
@@ -69,7 +71,8 @@ func startASR(ctx context.Context, lookahead, threads int) (*asrServer, error) {
 		return nil, err
 	}
 	cmd := exec.Command("uv", "run", "-q", "--script", script, "--serve", "0",
-		"--lookahead", fmt.Sprint(lookahead), "--threads", fmt.Sprint(threads))
+		"--lookahead", fmt.Sprint(lookahead), "--threads", fmt.Sprint(threads),
+		"--preload", strings.Join(preload, ","))
 	// Own process group: `uv` does not forward signals to the Python process it starts.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), "HF_HUB_DISABLE_PROGRESS_BARS=1", "TRANSFORMERS_VERBOSITY=error", "TQDM_DISABLE=1")
@@ -82,7 +85,7 @@ func startASR(ctx context.Context, lookahead, threads int) (*asrServer, error) {
 		return nil, fmt.Errorf("starting the speech recognizer: %w", err)
 	}
 	s := &asrServer{cmd: cmd}
-	log.Printf("loading the speech model (the first run downloads ~2.4 GB) …")
+	log.Printf("loading speech models for %s (the first run downloads ~2.4 GB per model) …", strings.Join(preload, ", "))
 	ready := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(out)
@@ -110,7 +113,7 @@ func startASR(ctx context.Context, lookahead, threads int) (*asrServer, error) {
 		s.Close()
 		return nil, ctx.Err()
 	}
-	log.Printf("speech model ready")
+	log.Printf("speech models ready")
 	return s, nil
 }
 
@@ -138,51 +141,84 @@ type asrStream struct {
 	audio   chan []byte
 	Words   chan Word
 	done    chan struct{}
+	ended   chan struct{} // closed when ffmpeg exits
+	err     error
 }
 
-func (s *asrServer) Open(ctx context.Context) (*asrStream, error) {
+// Open starts a stream fed with AAC segments through Push (IRIB's HLS follower).
+func (s *asrServer) Open(ctx context.Context, lang string) (*asrStream, error) {
+	return s.open(lang, exec.Command("ffmpeg", "-v", "error", "-f", "aac", "-i", "pipe:0",
+		"-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"), true)
+}
+
+// OpenURL starts a stream that ffmpeg reads from a URL itself (Icecast, HLS).
+func (s *asrServer) OpenURL(ctx context.Context, url, lang string) (*asrStream, error) {
+	args := []string{"-v", "error"}
+	if strings.HasPrefix(url, "http") && !strings.Contains(url, ".m3u8") {
+		args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30")
+	}
+	args = append(args, "-i", url, "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1")
+	return s.open(lang, exec.Command("ffmpeg", args...), false)
+}
+
+func (s *asrServer) open(lang string, decoder *exec.Cmd, pushed bool) (*asrStream, error) {
 	c, err := net.Dial("tcp", s.addr)
 	if err != nil {
 		return nil, err
 	}
-	st := &asrStream{conn: c.(*net.TCPConn), audio: make(chan []byte, 32), Words: make(chan Word, 256), done: make(chan struct{})}
-	// AAC segments -> ffmpeg -> 16 kHz mono PCM -> recognizer.
-	st.decoder = exec.Command("ffmpeg", "-v", "error", "-f", "aac", "-i", "pipe:0",
-		"-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1")
-	if st.decIn, err = st.decoder.StdinPipe(); err != nil {
+	header, _ := json.Marshal(map[string]string{"language": lang})
+	if _, err := c.Write(append(header, '\n')); err != nil {
 		c.Close()
 		return nil, err
 	}
-	pcm, err := st.decoder.StdoutPipe()
+	st := &asrStream{conn: c.(*net.TCPConn), audio: make(chan []byte, 32), Words: make(chan Word, 256),
+		done: make(chan struct{}), ended: make(chan struct{}), decoder: decoder}
+	if pushed {
+		if st.decIn, err = decoder.StdinPipe(); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	pcm, err := decoder.StdoutPipe()
 	if err != nil {
 		c.Close()
 		return nil, err
 	}
-	if err := st.decoder.Start(); err != nil {
+	var stderr strings.Builder
+	decoder.Stderr = &stderr
+	if err := decoder.Start(); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("starting ffmpeg: %w", err)
 	}
 	go func() {
 		io.Copy(st.conn, pcm)
 		st.conn.CloseWrite() // end of audio: the recognizer flushes and closes
+		st.err = decoder.Wait()
+		if msg := strings.TrimSpace(stderr.String()); msg != "" && st.err != nil {
+			st.err = fmt.Errorf("%v: %s", st.err, lastLine(msg))
+		}
+		close(st.ended)
 	}()
-	go func() {
-		for {
-			select {
-			case <-st.done:
-				st.decIn.Close()
-				return
-			case seg := <-st.audio:
-				if _, err := st.decIn.Write(seg); err != nil {
+	if pushed {
+		go func() {
+			for {
+				select {
+				case <-st.done:
+					st.decIn.Close()
 					return
+				case seg := <-st.audio:
+					if _, err := st.decIn.Write(seg); err != nil {
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 	go func() {
 		defer close(st.Words)
 		sc := bufio.NewScanner(st.conn)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		spaceBefore := true
 		for sc.Scan() {
 			var ev struct {
 				Type, Text string
@@ -191,12 +227,69 @@ func (s *asrServer) Open(ctx context.Context) (*asrStream, error) {
 			if json.Unmarshal(sc.Bytes(), &ev) != nil || ev.Type != "text" {
 				continue
 			}
-			for _, w := range strings.Fields(ev.Text) {
-				st.Words <- Word{Text: w, T: ev.T, At: time.Now()}
+			for _, w := range splitWords(ev.Text, &spaceBefore) {
+				w.T, w.At = ev.T, time.Now()
+				st.Words <- w
 			}
 		}
 	}()
 	return st, nil
+}
+
+// splitWords splits recognizer output into words, remembering where the
+// recognizer put spaces so the text can be rebuilt exactly (Chinese has none).
+// spaceBefore carries a trailing space over to the next piece.
+func splitWords(text string, spaceBefore *bool) []Word {
+	var out []Word
+	var cur strings.Builder
+	space := *spaceBefore
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			if cur.Len() > 0 {
+				out = append(out, Word{Text: cur.String(), Space: space})
+				cur.Reset()
+			}
+			space = true
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	if cur.Len() > 0 {
+		out = append(out, Word{Text: cur.String(), Space: space})
+		space = false
+	}
+	*spaceBefore = space
+	return out
+}
+
+// joinWords rebuilds text from words with the recognizer's own spacing.
+func joinWords(words []Word) string {
+	var b strings.Builder
+	for i, w := range words {
+		if i > 0 && w.Space {
+			b.WriteByte(' ')
+		}
+		b.WriteString(w.Text)
+	}
+	return b.String()
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return lines[len(lines)-1]
+}
+
+// Wait blocks until the audio source ends (direct streams) or ctx is done.
+func (st *asrStream) Wait(ctx context.Context) error {
+	select {
+	case <-st.ended:
+		if st.err != nil {
+			return fmt.Errorf("stream ended: %w", st.err)
+		}
+		return fmt.Errorf("stream ended")
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 // Push hands one AAC segment to the recognizer; it never blocks the caller.
@@ -217,10 +310,11 @@ func (st *asrStream) Close() {
 	default:
 		close(st.done)
 	}
-	done := make(chan struct{})
-	go func() { _ = st.decoder.Wait(); close(done) }()
+	if st.decIn == nil { // direct stream: stop ffmpeg reading the URL
+		_ = st.decoder.Process.Signal(os.Interrupt)
+	}
 	select {
-	case <-done:
+	case <-st.ended:
 	case <-time.After(3 * time.Second):
 		_ = st.decoder.Process.Kill()
 	}

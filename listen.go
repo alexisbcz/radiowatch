@@ -23,7 +23,9 @@ type liveConfig struct {
 	asrThreads  int
 	ollamaURL   string
 	ollamaModel string
-	translateTo string // empty = Persian transcript only
+	translateTo string // empty = transcript only
+	language    string // ISO 639-1 of the station
+	directURL   string // set for stations ffmpeg reads directly
 	showFA      bool
 	logFile     string
 	pause       time.Duration // silence that ends a phrase
@@ -31,7 +33,7 @@ type liveConfig struct {
 	maxWords    int           // hard cap on phrase length
 }
 
-// liveTranscriber streams audio into the recognizer, shows the Persian words as
+// liveTranscriber streams audio into the recognizer, shows the words as
 // they are recognised, cuts them into phrases and translates each phrase.
 type liveTranscriber struct {
 	cfg    liveConfig
@@ -44,7 +46,8 @@ type liveTranscriber struct {
 	queue  chan phrase
 
 	mu       sync.Mutex // guards terminal output and the current phrase
-	phrase   []string
+	phrase   []Word
+	units    float64 // phrase length in word-equivalents
 	started  time.Time
 	lastWord time.Time
 }
@@ -82,10 +85,15 @@ func newLiveTranscriber(ctx context.Context, cfg liveConfig) (*liveTranscriber, 
 	}
 
 	var err error
-	if lt.server, err = startASR(ctx, cfg.lookahead, cfg.asrThreads); err != nil {
+	if lt.server, err = startASR(ctx, cfg.lookahead, cfg.asrThreads, []string{cfg.language}); err != nil {
 		return nil, err
 	}
-	if lt.stream, err = lt.server.Open(ctx); err != nil {
+	if cfg.directURL != "" {
+		lt.stream, err = lt.server.OpenURL(ctx, cfg.directURL, cfg.language)
+	} else {
+		lt.stream, err = lt.server.Open(ctx, cfg.language)
+	}
+	if err != nil {
 		lt.server.Close()
 		return nil, err
 	}
@@ -113,11 +121,19 @@ func (lt *liveTranscriber) Close() {
 
 func (lt *liveTranscriber) readWords() {
 	for w := range lt.stream.Words {
-		lt.addWord(w.Text)
+		lt.addWord(w)
 	}
 }
 
-func (lt *liveTranscriber) addWord(w string) {
+// wordUnits: a word counts 1; a Chinese or Japanese character piece counts 1/2 per character.
+func wordUnits(w Word) float64 {
+	if isCJK(w.Text) {
+		return float64(len([]rune(w.Text))) / 2
+	}
+	return 1
+}
+
+func (lt *liveTranscriber) addWord(w Word) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	if len(lt.phrase) == 0 {
@@ -127,11 +143,15 @@ func (lt *liveTranscriber) addWord(w string) {
 		}
 	}
 	lt.phrase = append(lt.phrase, w)
+	lt.units += wordUnits(w)
 	lt.lastWord = time.Now()
 	if lt.tty && lt.cfg.showFA {
-		fmt.Print(w + " ")
+		if w.Space && len(lt.phrase) > 1 {
+			fmt.Print(" ")
+		}
+		fmt.Print(w.Text)
 	}
-	if len(lt.phrase) >= lt.cfg.maxWords {
+	if lt.units >= float64(lt.cfg.maxWords) {
 		lt.flushLocked()
 	}
 }
@@ -147,7 +167,7 @@ func (lt *liveTranscriber) pauseWatcher() {
 		case <-t.C:
 			lt.mu.Lock()
 			gap := time.Since(lt.lastWord)
-			if len(lt.phrase) > 0 && ((len(lt.phrase) >= lt.cfg.minWords && gap > lt.cfg.pause) || gap > 3*lt.cfg.pause) {
+			if len(lt.phrase) > 0 && ((lt.units >= float64(lt.cfg.minWords) && gap > lt.cfg.pause) || gap > 3*lt.cfg.pause) {
 				lt.flushLocked()
 			}
 			lt.mu.Unlock()
@@ -165,8 +185,8 @@ func (lt *liveTranscriber) flushLocked() {
 	if len(lt.phrase) == 0 {
 		return
 	}
-	p := phrase{at: lt.started, text: strings.Join(lt.phrase, " ")}
-	lt.phrase = nil
+	p := phrase{at: lt.started, text: joinWords(lt.phrase)}
+	lt.phrase, lt.units = nil, 0
 	if lt.cfg.showFA {
 		if lt.tty {
 			fmt.Print(reset + "\n")
@@ -217,7 +237,7 @@ func (lt *liveTranscriber) printTranslation(p phrase, tr string) {
 		fmt.Print("\r\033[2K")
 		fmt.Printf("%s%s%s%s\n", indent, bold, tr, reset)
 		if len(lt.phrase) > 0 && lt.cfg.showFA {
-			fmt.Printf("%s%s%s  %s%s ", dim, lt.started.Format("15:04:05"), reset, cyan, strings.Join(lt.phrase, " "))
+			fmt.Printf("%s%s%s  %s%s ", dim, lt.started.Format("15:04:05"), reset, cyan, joinWords(lt.phrase))
 		}
 	} else {
 		if !lt.cfg.showFA {
@@ -262,8 +282,9 @@ var langCodes = map[string]string{
 	"japanese": "ja", "dutch": "nl", "hebrew": "he", "hindi": "hi", "urdu": "ur",
 }
 
-func (lt *liveTranscriber) translate(fa string) (string, error) {
+func (lt *liveTranscriber) translate(text string) (string, error) {
 	lang := lt.cfg.translateTo
+	src, srcCode := langName(lt.cfg.language), lt.cfg.language
 	var msgs []map[string]string
 	if strings.HasPrefix(lt.cfg.ollamaModel, "translategemma") {
 		// TranslateGemma's prescribed prompt.
@@ -272,17 +293,17 @@ func (lt *liveTranscriber) translate(fa string) (string, error) {
 			target = fmt.Sprintf("%s (%s)", lang, code)
 		}
 		msgs = []map[string]string{{"role": "user", "content": fmt.Sprintf(
-			"You are a professional Persian (fa) to %[1]s translator. Your goal is to accurately convey "+
-				"the meaning and nuances of the original Persian text while adhering to %[2]s grammar, "+
+			"You are a professional %[4]s (%[5]s) to %[1]s translator. Your goal is to accurately convey "+
+				"the meaning and nuances of the original %[4]s text while adhering to %[2]s grammar, "+
 				"vocabulary, and cultural sensitivities.\nProduce only the %[2]s translation, without any "+
-				"additional explanations or commentary. Please translate the following Persian text into %[2]s:\n\n\n%[3]s",
-			target, lang, fa)}}
+				"additional explanations or commentary. Please translate the following %[4]s text into %[2]s:\n\n\n%[3]s",
+			target, lang, text, src, srcCode)}}
 	} else {
 		msgs = []map[string]string{
-			{"role": "system", "content": fmt.Sprintf("You translate a live Persian radio broadcast into %s. "+
-				"The Persian comes from automatic speech recognition, without punctuation, and may contain "+
-				"errors. Translate the meaning faithfully and naturally. Output only the %s translation.", lang, lang)},
-			{"role": "user", "content": fa},
+			{"role": "system", "content": fmt.Sprintf("You translate a live %s radio broadcast into %s. "+
+				"The text comes from automatic speech recognition and may contain errors. "+
+				"Translate the meaning faithfully and naturally. Output only the %s translation.", src, lang, lang)},
+			{"role": "user", "content": text},
 		}
 	}
 	payload, _ := json.Marshal(map[string]any{

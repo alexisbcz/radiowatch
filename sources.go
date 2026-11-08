@@ -20,6 +20,9 @@ type Station struct {
 	Language string `json:"language"` // ISO 639-1
 	Owner    string `json:"owner"`    // who runs it, shown with every claim
 	Focus    string `json:"focus"`    // news, talk, regional, culture, music, religious…
+	// Direct streams (Icecast, standard HLS) are read by ffmpeg itself; others
+	// (IRIB's raw-AAC HLS) go through the built-in playlist follower.
+	Direct   bool `json:"-"`
 	provider Provider
 }
 
@@ -31,7 +34,7 @@ type Provider interface {
 	Resolve(ctx context.Context, s Station) (string, error) // live stream URL (HLS playlist)
 }
 
-var providers = []Provider{iribProvider{}}
+var providers = []Provider{iribProvider{}, staticProvider{"ru", russianStations}, staticProvider{"cn", chineseStations}}
 
 func allStations(ctx context.Context) ([]Station, error) {
 	var out []Station
@@ -43,6 +46,61 @@ func allStations(ctx context.Context) ([]Station, error) {
 		out = append(out, st...)
 	}
 	return out, nil
+}
+
+// staticProvider serves a fixed list of stations with known stream URLs.
+type staticProvider struct {
+	prefix   string
+	stations []staticStation
+}
+
+type staticStation struct {
+	Station
+	URL string
+}
+
+func (p staticProvider) Prefix() string { return p.prefix }
+
+func (p staticProvider) Stations(ctx context.Context) ([]Station, error) {
+	out := make([]Station, len(p.stations))
+	for i, s := range p.stations {
+		out[i] = s.Station
+		out[i].Direct, out[i].provider = true, p
+	}
+	return out, nil
+}
+
+func (p staticProvider) Resolve(ctx context.Context, st Station) (string, error) {
+	for _, s := range p.stations {
+		if s.ID == st.ID {
+			return s.URL, nil
+		}
+	}
+	return "", fmt.Errorf("unknown station %s", st.ID)
+}
+
+// Russian state and state-aligned radio. VGTRK, Rossiya Segodnya and Zvezda are
+// state-owned; the Crimea stations are run by the Russian-installed authorities.
+var russianStations = []staticStation{
+	{Station{ID: "ru:vesti", Name: "Vesti FM", Native: "Вести ФМ", Country: "RU", Language: "ru", Owner: "VGTRK (Russian state broadcaster)", Focus: "news"}, "https://icecast-vgtrk.cdnvideo.ru/vestifm_mp3_128kbps"},
+	{Station{ID: "ru:rossii", Name: "Radio Rossii", Native: "Радио России", Country: "RU", Language: "ru", Owner: "VGTRK (Russian state broadcaster)", Focus: "news"}, "https://icecast-vgtrk.cdnvideo.ru/rrzonam_mp3_128kbps"},
+	{Station{ID: "ru:sputnik", Name: "Radio Sputnik", Native: "Радио Спутник", Country: "RU", Language: "ru", Owner: "Rossiya Segodnya (Russian state media group)", Focus: "news"}, "https://icecast-rian.cdnvideo.ru/voicerus"},
+	{Station{ID: "ru:zvezda", Name: "Radio Zvezda", Native: "Радио Звезда", Country: "RU", Language: "ru", Owner: "Zvezda (Russian Ministry of Defence)", Focus: "news"}, "https://zvezda-radio.mediacdn.ru/radio/zvezda/zvezda_128"},
+	{Station{ID: "ru:mayak", Name: "Radio Mayak", Native: "Маяк", Country: "RU", Language: "ru", Owner: "VGTRK (Russian state broadcaster)", Focus: "talk"}, "https://icecast-vgtrk.cdnvideo.ru/mayakfm_mp3_128kbps"},
+	{Station{ID: "ru:bfm", Name: "Business FM", Native: "Business FM", Country: "RU", Language: "ru", Owner: "Rumedia (private)", Focus: "economy"}, "https://bfm.hostingradio.ru:9075/fm"},
+	{Station{ID: "ru:krym", Name: "Radio Krym (Crimea)", Native: "Радио Крым", Country: "RU", Language: "ru", Owner: "Crimea TV and Radio Company (Russian-installed authorities)", Focus: "regional"}, "http://fm.1tvcrimea.ru:19000/stream.mp3"},
+	{Station{ID: "ru:sevastopol", Name: "Govorit Sevastopol (Crimea)", Native: "Говорит Севастополь", Country: "RU", Language: "ru", Owner: "Sevastopol city broadcaster (Russian-installed authorities)", Focus: "regional"}, "https://sevfm.ru:9006/govsev"},
+}
+
+// Chinese state radio: China National Radio (CNR) and the former China Radio
+// International (CRI), both part of China Media Group (CMG).
+var chineseStations = []staticStation{
+	{Station{ID: "cn:cnr1", Name: "CNR-1 Voice of China", Native: "中国之声", Country: "CN", Language: "zh", Owner: "China National Radio (CMG, Chinese state broadcaster)", Focus: "news"}, "https://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
+	{Station{ID: "cn:global", Name: "CMG Global News Radio", Native: "环球资讯广播", Country: "CN", Language: "zh", Owner: "China Media Group (Chinese state broadcaster)", Focus: "news"}, "https://sk.cri.cn/905.m3u8"},
+	{Station{ID: "cn:cnr2", Name: "CNR-2 Voice of Economy", Native: "经济之声", Country: "CN", Language: "zh", Owner: "China National Radio (CMG, Chinese state broadcaster)", Focus: "economy"}, "https://ngcdn001.cnr.cn/live/jjzs/index.m3u8"},
+	{Station{ID: "cn:zhonghua", Name: "Voice of Zhonghua (for Taiwan)", Native: "中华之声", Country: "CN", Language: "zh", Owner: "China National Radio (CMG, Chinese state broadcaster)", Focus: "cross-strait"}, "https://ngcdn001.cnr.cn/live/zhzs/index.m3u8"},
+	{Station{ID: "cn:huaxia", Name: "Voice of Huaxia (for Taiwan, Hong Kong, Macau)", Native: "华夏之声", Country: "CN", Language: "zh", Owner: "China National Radio (CMG, Chinese state broadcaster)", Focus: "cross-strait"}, "https://ngcdn001.cnr.cn/live/hxzs/index.m3u8"},
+	{Station{ID: "cn:beijing", Name: "Beijing News Radio", Native: "北京新闻广播", Country: "CN", Language: "zh", Owner: "Beijing Radio and Television Station (state)", Focus: "regional"}, "https://brtv-radiolive.rbc.cn/alive/fm945.m3u8"},
 }
 
 // findStation accepts "ir:26", or a bare channel number for the IRIB provider.
@@ -156,7 +214,7 @@ func (p iribProvider) Stations(ctx context.Context) ([]Station, error) {
 }
 
 func focusRank(f string) int {
-	for i, x := range []string{"news", "talk", "economy", "regional", "general", "culture", "sport", "music", "religious"} {
+	for i, x := range []string{"news", "talk", "cross-strait", "economy", "regional", "general", "culture", "sport", "music", "religious"} {
 		if f == x {
 			return i
 		}

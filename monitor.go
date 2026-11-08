@@ -74,12 +74,24 @@ func runMonitor(ctx context.Context, cfg monitorConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := loadGazetteer(ctx, "IR"); err != nil {
-		log.Printf("geocoding disabled: %v", err)
-	}
 	m := &monitor{cfg: cfg, recent: map[string]recentWindow{}, ext: newExtractor(cfg.llm), store: store, jobs: make(chan job, 64),
 		httpc: &http.Client{Timeout: 20 * time.Second}}
-	if m.asr, err = startASR(ctx, cfg.lookahead, cfg.asrThreads); err != nil {
+	var langs []string
+	countries := map[string]bool{}
+	for _, s := range cfg.stations {
+		if !contains(langs, s.Language) {
+			langs = append(langs, s.Language)
+		}
+		countries[s.Country] = true
+	}
+	for c := range countries {
+		for _, g := range gazetteersFor[c] {
+			if err := loadGazetteer(ctx, g); err != nil {
+				log.Printf("geocoding for %s disabled: %v", g, err)
+			}
+		}
+	}
+	if m.asr, err = startASR(ctx, cfg.lookahead, cfg.asrThreads, langs); err != nil {
 		return err
 	}
 	defer m.asr.Close()
@@ -126,7 +138,12 @@ func (m *monitor) connect(ctx context.Context, st *stationState) error {
 	if err != nil {
 		return err
 	}
-	asrs, err := m.asr.Open(ctx)
+	var asrs *asrStream
+	if st.Station.Direct {
+		asrs, err = m.asr.OpenURL(ctx, url, st.Station.Language)
+	} else {
+		asrs, err = m.asr.Open(ctx, st.Station.Language)
+	}
 	if err != nil {
 		return err
 	}
@@ -148,6 +165,9 @@ func (m *monitor) connect(ctx context.Context, st *stationState) error {
 	st.Connected, st.Since, st.Error = true, time.Now(), ""
 	st.mu.Unlock()
 	log.Printf("%s: connected (%s)", st.Station.Name, url)
+	if st.Station.Direct {
+		return asrs.Wait(ctx)
+	}
 	return stream(ctx, url, func(seg []byte) error {
 		if !asrs.Push(seg) {
 			log.Printf("%s: recognizer is behind; dropped 10 s of audio", st.Station.Name)
@@ -174,13 +194,9 @@ func (m *monitor) windowLoop(ctx context.Context, st *stationState) {
 			continue
 		}
 		start, end := words[0].At, words[len(words)-1].At
-		parts := make([]string, len(words))
-		for i, w := range words {
-			parts[i] = w.Text
-		}
-		text := strings.Join(parts, " ")
+		text := joinWords(words)
 		m.archive(st.Station, start, end, text)
-		if len(words) < m.cfg.minWords {
+		if speechAmount(text) < m.cfg.minWords {
 			continue // mostly music or silence
 		}
 		if other := m.simulcastOf(st, text); other != "" {
@@ -200,10 +216,16 @@ func (m *monitor) windowLoop(ctx context.Context, st *stationState) {
 // channels; extracting it once saves LLM time, and the copies are not
 // independent sources.
 func (m *monitor) simulcastOf(st *stationState, text string) string {
-	words := strings.Fields(text)
 	set := map[string]bool{}
-	for _, w := range words {
-		set[w] = true
+	if isCJK(text) { // no spaces: compare character pairs
+		r := []rune(compact(text))
+		for i := 0; i+2 <= len(r); i++ {
+			set[string(r[i:i+2])] = true
+		}
+	} else {
+		for _, w := range strings.Fields(text) {
+			set[w] = true
+		}
 	}
 	m.recentMu.Lock()
 	defer m.recentMu.Unlock()

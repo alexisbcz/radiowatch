@@ -141,16 +141,25 @@ func cmdListen(ctx context.Context, args []string) error {
 		*transcribe = true
 	}
 
-	master := *streamURL
+	master, lang, direct := *streamURL, "fa", *streamURL != "" && !strings.Contains(*streamURL, "iranseda")
+	var station Station
 	if master == "" {
-		s, err := findStation(ctx, *ch)
-		if err != nil {
+		var err error
+		if station, err = findStation(ctx, *ch); err != nil {
 			return err
 		}
-		if master, err = resolveWithRetry(ctx, s); err != nil {
+		if master, err = resolveWithRetry(ctx, station); err != nil {
 			return err
 		}
-		log.Printf("%s: %s", s.Name, master)
+		lang, direct = station.Language, station.Direct
+		log.Printf("%s (%s): %s", station.Name, station.Owner, master)
+	}
+	if direct {
+		return listenDirect(ctx, master, lang, *player, *transcribe, liveConfig{
+			lookahead: *lookahead, asrThreads: *asrThreads, ollamaURL: *ollamaURL, ollamaModel: *ollamaModel,
+			translateTo: *translateTo, showFA: *showFA, logFile: *logFile, pause: *pause,
+			minWords: *minWords, maxWords: *maxWords, language: lang, directURL: master,
+		})
 	}
 
 	var writers []io.Writer
@@ -177,7 +186,7 @@ func cmdListen(ctx context.Context, args []string) error {
 		lt, err := newLiveTranscriber(ctx, liveConfig{
 			lookahead: *lookahead, asrThreads: *asrThreads, ollamaURL: *ollamaURL, ollamaModel: *ollamaModel,
 			translateTo: *translateTo, showFA: *showFA, logFile: *logFile, pause: *pause,
-			minWords: *minWords, maxWords: *maxWords,
+			minWords: *minWords, maxWords: *maxWords, language: lang,
 		})
 		if err != nil {
 			return fmt.Errorf("transcription: %w", err)
@@ -220,6 +229,44 @@ func cmdListen(ctx context.Context, args []string) error {
 		_ = cmd.Process.Signal(os.Interrupt)
 		_ = cmd.Wait()
 	}
+	return nil
+}
+
+// listenDirect plays and transcribes a stream that mpv and ffmpeg read
+// themselves (Icecast, standard HLS).
+func listenDirect(ctx context.Context, url, lang, player string, transcribe bool, cfg liveConfig) error {
+	if cfg.translateTo != "" {
+		transcribe = true
+	}
+	var cmd *exec.Cmd
+	switch player {
+	case "mpv":
+		cmd = exec.CommandContext(ctx, "mpv", "--no-video", "--really-quiet", url)
+	case "ffplay":
+		cmd = exec.CommandContext(ctx, "ffplay", "-nodisp", "-loglevel", "error", url)
+	case "none":
+	default:
+		return fmt.Errorf("unknown player %q (use mpv, ffplay or none)", player)
+	}
+	if !transcribe && cmd == nil {
+		return fmt.Errorf("nothing to do: use a player, -transcribe, or both")
+	}
+	if transcribe {
+		lt, err := newLiveTranscriber(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("transcription: %w", err)
+		}
+		defer lt.Close()
+	}
+	if cmd != nil {
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("starting %s: %w", player, err)
+		}
+		defer func() { _ = cmd.Process.Signal(os.Interrupt); _ = cmd.Wait() }()
+	}
+	log.Printf("streaming; Ctrl+C to stop")
+	<-ctx.Done()
 	return nil
 }
 

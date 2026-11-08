@@ -73,7 +73,7 @@ func (x *extractor) extract(ctx context.Context, st Station, start, end time.Tim
 			strings.Join(recent, "\n- ") + "\n"
 	}
 	sys := strings.NewReplacer(
-		"{{station}}", st.Name, "{{country}}", st.Country, "{{language}}", st.Language,
+		"{{station}}", st.Name, "{{country}}", countryName(st.Country), "{{language}}", langName(st.Language),
 		"{{owner}}", st.Owner, "{{start}}", start.UTC().Format("2006-01-02 15:04"),
 		"{{end}}", end.UTC().Format("15:04"), "{{recent}}", recentNote,
 	).Replace(extractPrompt)
@@ -125,6 +125,25 @@ func (x *extractor) extract(ctx context.Context, st Station, start, end time.Tim
 	return out.Items, nil
 }
 
+var langNames = map[string]string{"fa": "Persian", "ru": "Russian", "zh": "Chinese (Mandarin)", "en": "English",
+	"ar": "Arabic", "uk": "Ukrainian", "tr": "Turkish"}
+
+func langName(code string) string {
+	if n, ok := langNames[code]; ok {
+		return n
+	}
+	return code
+}
+
+var countryNames = map[string]string{"IR": "Iran", "RU": "Russia", "CN": "China"}
+
+func countryName(code string) string {
+	if n, ok := countryNames[code]; ok {
+		return n
+	}
+	return code
+}
+
 // normFa folds Persian/Arabic letter variants and drops spacing, diacritics and
 // punctuation, so quotes can be matched against the transcript.
 func normFa(s string) string {
@@ -140,9 +159,13 @@ func normFa(s string) string {
 }
 
 // quoteFound reports whether the quote really comes from the transcript: most
-// of its words occur there, and at least one exact three-word run does. A guard
+// of its words occur there, and at least one exact three-word run does (for
+// scripts without spaces, such as Chinese, three-character runs). A guard
 // against quotes (and so claims) the model made up.
 func quoteFound(quote, transcript string) bool {
+	if isCJK(transcript) {
+		return runsFound([]rune(compact(quote)), []rune(compact(transcript)), 3)
+	}
 	q := strings.Fields(normFa(quote))
 	t := strings.Fields(normFa(transcript))
 	if len(q) == 0 || len(t) == 0 {
@@ -171,4 +194,54 @@ func quoteFound(quote, transcript string) bool {
 		}
 	}
 	return false
+}
+
+// runsFound: at least 70% of the quote's n-character runs occur in the transcript.
+func runsFound(q, t []rune, n int) bool {
+	if len(q) < n {
+		return strings.Contains(string(t), string(q)) && len(q) > 0
+	}
+	ts := string(t)
+	hits, total := 0, 0
+	for i := 0; i+n <= len(q); i++ {
+		total++
+		if strings.Contains(ts, string(q[i:i+n])) {
+			hits++
+		}
+	}
+	return hits*10 >= total*7
+}
+
+// compact keeps only letters and digits (no spaces or punctuation).
+func compact(s string) string {
+	var b strings.Builder
+	for _, c := range normFa(s) {
+		if unicode.IsLetter(c) || unicode.IsDigit(c) {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// isCJK reports whether text is mostly Chinese, Japanese or Korean characters.
+func isCJK(s string) bool {
+	cjk, letters := 0, 0
+	for _, c := range s {
+		if unicode.IsLetter(c) {
+			letters++
+			if unicode.Is(unicode.Han, c) || unicode.Is(unicode.Hiragana, c) || unicode.Is(unicode.Katakana, c) || unicode.Is(unicode.Hangul, c) {
+				cjk++
+			}
+		}
+	}
+	return letters > 0 && cjk*2 > letters
+}
+
+// speechAmount estimates how much was said, in word-equivalents: words for
+// spaced scripts, characters / 2 for Chinese and Japanese.
+func speechAmount(text string) int {
+	if isCJK(text) {
+		return len([]rune(compact(text))) / 2
+	}
+	return len(strings.Fields(text))
 }

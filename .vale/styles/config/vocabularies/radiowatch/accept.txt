@@ -70,3 +70,25 @@ Mohsen
 Bab
 Islamabad
 World Monitor
+Vesti
+Rossii
+Sputnik
+Zvezda
+Mayak
+Krym
+Govorit
+Sevastopol
+VGTRK
+Rossiya
+Segodnya
+Novosti
+Zhonghua
+Huaxia
+CMG
+Kosiniak-Kamysz
+Katz
+Icecast
+IRGC
+Barak
+Ehud
+Geocoding

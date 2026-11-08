@@ -57,14 +57,14 @@ func (m *monitor) serve(ctx context.Context) {
 				continue
 			}
 			st.mu.Lock()
-			var words []string
+			var words []Word
 			for _, wd := range st.tail {
 				if time.Since(wd.At) <= time.Duration(minutes)*time.Minute {
-					words = append(words, wd.Text)
+					words = append(words, wd)
 				}
 			}
 			st.mu.Unlock()
-			writeJSON(w, map[string]any{"station": st.Station, "minutes": minutes, "text": strings.Join(words, " ")})
+			writeJSON(w, map[string]any{"station": st.Station, "minutes": minutes, "text": joinWords(words)})
 			return
 		}
 		http.Error(w, "unknown station", http.StatusNotFound)
